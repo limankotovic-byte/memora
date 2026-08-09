@@ -1198,10 +1198,11 @@ Respond with JSON only (no markdown):
                 {"role": "user", "content": prompt},
             ],
             temperature=0.1,
-            max_tokens=200,
+            max_tokens=600,
         )
 
         result_text = response.choices[0].message.content.strip()
+        result_text = re.sub(r"^```(?:json)?\s*|\s*```$", "", result_text, flags=re.S)
         result = json.loads(result_text)
 
         # Validate and coerce fields

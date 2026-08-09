@@ -380,6 +380,27 @@ memory_merge(source_id=123, target_id=456, merge_strategy="append")
 
 Works with any OpenAI-compatible API (OpenAI, OpenRouter, Azure, etc.) via `OPENAI_BASE_URL`.
 
+**Practical setup — NVIDIA NIM (free tier, no card required):**
+
+```env
+OPENAI_API_KEY=nvapi-...          # from build.nvidia.com
+OPENAI_BASE_URL=https://integrate.api.nvidia.com/v1
+MEMORA_LLM_MODEL=nvidia/nemotron-3-ultra-550b-a55b
+MEMORA_LLM_ENABLED=true
+```
+
+Available on NIM: `nvidia/nemotron-3-ultra-550b-a55b`, `deepseek-ai/deepseek-v4-flash-0731`, and others (list via `GET /v1/models`).
+
+**Note on `max_tokens`:** verbatim models (e.g. Nemotron 3 Ultra) may exceed the default 200-token cap and truncate the JSON reply, which degrades classification to `neither`. Bump to 600 in `classify_supersession_llm` (memora/storage.py). The parser also strips ```json fenced output defensively.
+
+**Supersession detection** (finds "A is a newer version of B" pairs and links them via `supersedes` edges, hiding outdated memories from active retrieval):
+
+```python
+memory_detect_supersessions(min_similarity=0.55, limit=20, dry_run=True)
+```
+
+Runs in two phases: embedding-similarity candidates → LLM classification (neutral A/B, LLM decides direction). Rate-limited server-side (120s cooldown); with slow remote LLMs, prefer `limit=1-2` per MCP call or run the full sweep via a local script.
+
 </details>
 
 <details id="document-storage">
