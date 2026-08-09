@@ -4220,6 +4220,8 @@ def hybrid_search(
     tags_none: Optional[List[str]] = None,
     auto_rebuild: bool = True,
     follow: Optional[str] = None,
+    rerank: bool = False,
+    rerank_top_n: int = 40,
 ) -> List[Dict[str, Any]]:
     """Combine FTS keyword search and semantic vector search using Reciprocal Rank Fusion.
 
@@ -4236,6 +4238,9 @@ def hybrid_search(
         tags_all: Match memories with ALL of these tags
         tags_none: Exclude memories with ANY of these tags
         auto_rebuild: If True, automatically rebuild embeddings on model mismatch
+        rerank: If True, reorder fused candidates with a cross-encoder reranker
+                (see memora.reranker). Scores keep the RRF scale; only order changes.
+        rerank_top_n: How many top fused candidates to pass to the reranker
 
     Returns:
         List of memories with combined scores, sorted by relevance
@@ -4304,6 +4309,18 @@ def hybrid_search(
 
     # 4. Sort by combined score and apply filters
     sorted_ids = sorted(scores.keys(), key=lambda x: scores[x], reverse=True)
+
+    # 4b. Optional cross-encoder rerank: reorder only, scores stay on RRF scale
+    if rerank and sorted_ids:
+        from .reranker import rerank
+
+        candidates = [
+            (memory_id, memories_by_id[memory_id].get("content", "") or "")
+            for memory_id in sorted_ids
+        ]
+        reranked_ids = rerank(query, candidates, rerank_top_n)
+        if reranked_ids:
+            sorted_ids = reranked_ids
 
     results: List[Dict[str, Any]] = []
     for memory_id in sorted_ids:

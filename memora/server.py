@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import logging
 import os
 import re
@@ -445,6 +446,8 @@ def _hybrid_search(
     tags_all: Optional[List[str]],
     tags_none: Optional[List[str]],
     follow: Optional[str] = None,
+    rerank: bool = False,
+    rerank_top_n: int = 40,
 ):
     return hybrid_search(
         conn,
@@ -459,6 +462,8 @@ def _hybrid_search(
         tags_all=tags_all,
         tags_none=tags_none,
         follow=follow,
+        rerank=rerank,
+        rerank_top_n=rerank_top_n,
     )
 
 
@@ -2031,11 +2036,18 @@ async def memory_hybrid_search(
     preview_chars: int = 300,
     fields: Optional[List[str]] = None,
     follow: Optional[str] = None,
+    rerank: bool = False,
+    rerank_top_n: int = 40,
 ) -> Dict[str, Any]:
     """Perform a hybrid search combining keyword (FTS) and semantic (vector) search.
 
     Uses Reciprocal Rank Fusion (RRF) to merge results from both search methods,
     providing better results than either method alone.
+
+    With rerank=True, the fused candidates are additionally reordered by a local
+    cross-encoder reranker (BAAI/bge-reranker-base by default, override with the
+    MEMORA_RERANKER_MODEL env var; set to "none" to disable). Reranking is slower
+    than plain RRF, so it is off by default.
 
     Returns compact previews by default. Use content_mode="full" for complete content.
     Use memory_get to fetch full content for specific IDs.
@@ -2058,6 +2070,8 @@ async def memory_hybrid_search(
                 omit "score" for flat list of memory dicts.
         follow: Lineage mode — "latest" resolves each result to its current version,
                 "active" excludes superseded memories, "full_history" expands supersession chains.
+        rerank: Reorder fused results with the cross-encoder reranker (default: False)
+        rerank_top_n: How many top fused candidates to rerank (default: 40)
 
     Returns:
         Dictionary with count and list of results, each containing score and memory
@@ -2067,7 +2081,8 @@ async def memory_hybrid_search(
     except ValueError as exc:
         return {"error": "invalid_follow", "message": str(exc)}
     try:
-        results = _hybrid_search(
+        results = await asyncio.to_thread(
+            _hybrid_search,
             query,
             semantic_weight,
             top_k,
@@ -2078,7 +2093,9 @@ async def memory_hybrid_search(
             tags_any,
             tags_all,
             tags_none,
-            follow=follow,
+            follow,
+            rerank,
+            rerank_top_n,
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
