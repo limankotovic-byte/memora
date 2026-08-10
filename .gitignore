@@ -28,3 +28,6 @@ plans/
 
 # Research output
 research/
+
+# Local demo scripts
+compare_demo.py
