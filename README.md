@@ -471,6 +471,26 @@ systemctl --user daemon-reload
 systemctl --user enable --now audit-edges.timer
 ```
 
+**Monthly supersession sweep** — same pair of units, first Sunday of the month at 10:00 (does not collide with the weekly run at 19:00):
+
+```ini
+# audit-wide.service
+[Service]
+Type=oneshot
+WorkingDirectory=/home/you/memora
+ExecStart=/home/you/.local/bin/uv run python scripts/audit_edges.py --wide
+```
+
+```ini
+# audit-wide.timer
+[Timer]
+OnCalendar=Sun *-*-01..07 10:00
+Persistent=true
+Unit=audit-wide.service
+[Install]
+WantedBy=timers.target
+```
+
 </details>
 
 <details id="document-storage">
