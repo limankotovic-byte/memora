@@ -21,6 +21,7 @@ from ..storage import (  # noqa: E402
     connect,
     detect_clusters,
     get_crossrefs,
+    get_relationships,
     get_memory,
     list_memories,
     rebuild_crossrefs,
@@ -310,16 +311,25 @@ def _build_section_mappings(memories: List[Dict]) -> tuple:
 
 
 def _build_edges(conn, memories: List[Dict], min_score: float) -> List[Dict]:
-    """Build vis.js edge objects from crossrefs."""
+    """Build vis.js edge objects from similarity and explicit relationships."""
     edges = []
     seen = set()
     edge_id = 0
     for m in memories:
-        for ref in get_crossrefs(conn, m["id"]):
-            edge_key = tuple(sorted([m["id"], ref["id"]]))
-            if edge_key not in seen and ref.get("score", 0) > min_score:
+        for ref in get_relationships(conn, m["id"]):
+            edge_type = ref.get("edge_type", "related_to")
+            is_explicit = "source" in ref
+            edge_key = (
+                (m["id"], ref["id"], edge_type)
+                if is_explicit else tuple(sorted([m["id"], ref["id"]]))
+            )
+            if edge_key not in seen and (is_explicit or ref.get("score", 0) > min_score):
                 seen.add(edge_key)
-                edges.append({"id": edge_id, "from": m["id"], "to": ref["id"]})
+                edge = {"id": edge_id, "from": m["id"], "to": ref["id"]}
+                if is_explicit:
+                    edge["label"] = edge_type
+                    edge["arrows"] = "to"
+                edges.append(edge)
                 edge_id += 1
     return edges
 

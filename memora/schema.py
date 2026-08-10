@@ -1,6 +1,7 @@
 """Database schema management and connection helpers."""
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import weakref
@@ -126,10 +127,12 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_fts(conn)
     _ensure_embeddings_table(conn)
     _ensure_crossrefs_table(conn)
+    _ensure_memory_edges_table(conn)
     _ensure_events_table(conn)
     _ensure_actions_table(conn)
     _ensure_importance_columns(conn)
     _ensure_updated_at_column(conn)
+    _migrate_legacy_explicit_edges(conn)
 
 
 def _ensure_fts(conn: sqlite3.Connection) -> None:
@@ -177,6 +180,115 @@ def _ensure_crossrefs_table(conn: sqlite3.Connection) -> None:
             related TEXT,
             FOREIGN KEY(memory_id) REFERENCES memories(id) ON DELETE CASCADE
         )
+        """
+    )
+    conn.commit()
+
+
+def _ensure_memory_edges_table(conn: sqlite3.Connection) -> None:
+    """Create durable, typed relationships separate from similarity crossrefs."""
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memory_edges (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            from_memory_id INTEGER NOT NULL,
+            to_memory_id INTEGER NOT NULL,
+            relation_type TEXT NOT NULL,
+            relation_confidence REAL,
+            source TEXT NOT NULL DEFAULT 'manual',
+            reason TEXT,
+            created_at TEXT NOT NULL DEFAULT (datetime('now')),
+            UNIQUE(from_memory_id, to_memory_id, relation_type),
+            FOREIGN KEY(from_memory_id) REFERENCES memories(id) ON DELETE CASCADE,
+            FOREIGN KEY(to_memory_id) REFERENCES memories(id) ON DELETE CASCADE
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memory_edges_from
+        ON memory_edges(from_memory_id)
+        """
+    )
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_memory_edges_to
+        ON memory_edges(to_memory_id)
+        """
+    )
+    conn.commit()
+
+
+def _migrate_legacy_explicit_edges(conn: sqlite3.Connection) -> None:
+    """Move legacy typed links out of the computed crossref cache once.
+
+    Older versions stored both embedding-similarity neighbours and explicit
+    semantic relationships in ``memories_crossrefs.related``.  Typed links and
+    manually-created ``related_to`` links used a score of 1.0, while computed
+    links contain cosine similarity scores.  Keep the latter in the cache and
+    migrate the former into ``memory_edges``.
+    """
+    migrated = conn.execute(
+        "SELECT value FROM memories_meta WHERE key = 'memory_edges_migrated_v1'"
+    ).fetchone()
+    if migrated:
+        return
+
+    rows = conn.execute(
+        "SELECT memory_id, related FROM memories_crossrefs WHERE related IS NOT NULL"
+    ).fetchall()
+    for memory_id, related_json in rows:
+        try:
+            related = json.loads(related_json)
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not isinstance(related, list):
+            continue
+
+        computed_refs = []
+        for ref in related:
+            if not isinstance(ref, dict):
+                continue
+            try:
+                target_id = int(ref.get("id"))
+            except (TypeError, ValueError):
+                continue
+            if memory_id == target_id:
+                continue
+
+            relation_type = ref.get("edge_type", "related_to")
+            score = ref.get("score", 0.0)
+            is_explicit = relation_type != "related_to"
+            if relation_type == "related_to":
+                try:
+                    is_explicit = float(score) >= 0.9999
+                except (TypeError, ValueError):
+                    is_explicit = False
+            if not is_explicit:
+                computed_refs.append(ref)
+                continue
+
+            conn.execute(
+                """
+                INSERT INTO memory_edges(
+                    from_memory_id, to_memory_id, relation_type, source, reason
+                ) VALUES (?, ?, ?, 'legacy_migration', 'Migrated from legacy crossrefs')
+                ON CONFLICT(from_memory_id, to_memory_id, relation_type) DO NOTHING
+                """,
+                (memory_id, target_id, relation_type),
+            )
+
+        computed_json = json.dumps(computed_refs, ensure_ascii=False) if computed_refs else None
+        conn.execute(
+            "UPDATE memories_crossrefs SET related = ? WHERE memory_id = ?",
+            (computed_json, memory_id),
+        )
+
+    conn.execute(
+        """
+        INSERT INTO memories_meta(key, value)
+        VALUES ('memory_edges_migrated_v1', '1')
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
         """
     )
     conn.commit()

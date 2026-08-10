@@ -176,6 +176,147 @@ def test_semantic_search_basic(local_db):
         assert any("python" in r["memory"]["content"].lower() for r in results)
 
 
+def test_explicit_edges_survive_crossref_rebuild_and_keep_lineage(local_db):
+    """Similarity maintenance must never overwrite durable semantic edges."""
+    with storage.connect() as conn:
+        old = storage.add_memory(
+            conn,
+            content="Service uses the old configuration value for production",
+            tags=["config"],
+        )
+        current = storage.add_memory(
+            conn,
+            content="Service uses the current configuration value for production",
+            tags=["config"],
+        )
+
+        storage.add_link(
+            conn,
+            current["id"],
+            old["id"],
+            edge_type="supersedes",
+            relation_confidence=0.93,
+            source="llm",
+            reason="Current configuration fully replaces the old value",
+        )
+        storage.rebuild_crossrefs(conn)
+
+        edges = storage.get_explicit_edges(conn, current["id"])
+        assert len(edges) == 1
+        assert edges[0]["id"] == old["id"]
+        assert edges[0]["edge_type"] == "supersedes"
+        assert edges[0]["relation_confidence"] == 0.93
+        assert edges[0]["source"] == "llm"
+        assert storage.get_crossrefs(conn, current["id"]) != edges
+
+        active = storage.hybrid_search(conn, "production configuration", follow="active")
+        active_ids = {entry["memory"]["id"] for entry in active}
+        assert current["id"] in active_ids
+        assert old["id"] not in active_ids
+
+
+def test_legacy_typed_crossrefs_migrate_to_durable_edges(local_db):
+    with storage.connect() as conn:
+        old = storage.add_memory(conn, content="Legacy previous service configuration", tags=["config"])
+        current = storage.add_memory(conn, content="Legacy current service configuration", tags=["config"])
+        storage._store_crossrefs(
+            conn,
+            old["id"],
+            [{"id": current["id"], "score": 0.7, "edge_type": "related_to"}],
+        )
+        storage._store_crossrefs(
+            conn,
+            current["id"],
+            [{"id": old["id"], "score": 1.0, "edge_type": "supersedes"}],
+        )
+        conn.execute("DELETE FROM memories_meta WHERE key = 'memory_edges_migrated_v1'")
+
+        from memora.schema import _migrate_legacy_explicit_edges
+
+        _migrate_legacy_explicit_edges(conn)
+
+        assert storage.get_crossrefs(conn, old["id"])[0]["score"] == 0.7
+        assert storage.get_crossrefs(conn, current["id"]) == []
+        migrated = storage.get_explicit_edges(conn, current["id"])
+        assert migrated[0]["id"] == old["id"]
+        assert migrated[0]["edge_type"] == "supersedes"
+        assert migrated[0]["source"] == "legacy_migration"
+
+
+def test_explicit_edge_rejects_invalid_confidence_and_supersession_cycles(local_db):
+    with storage.connect() as conn:
+        first = storage.add_memory(conn, content="First version of the deployment plan", tags=["plan"])
+        second = storage.add_memory(conn, content="Second version of the deployment plan", tags=["plan"])
+
+        try:
+            storage.add_link(
+                conn,
+                second["id"],
+                first["id"],
+                edge_type="supersedes",
+                relation_confidence=1.1,
+            )
+            assert False, "Expected confidence validation error"
+        except ValueError:
+            pass
+
+        storage.add_link(conn, second["id"], first["id"], edge_type="supersedes")
+        try:
+            storage.add_link(conn, first["id"], second["id"], edge_type="supersedes")
+            assert False, "Expected supersession cycle validation error"
+        except ValueError:
+            pass
+
+
+def test_relationship_expansion_uses_explicit_edges_not_similarity_cache(local_db):
+    with storage.connect() as conn:
+        seed = storage.add_memory(
+            conn,
+            content="How to deploy the API service safely",
+            tags=["deployment"],
+        )
+        extension = storage.add_memory(
+            conn,
+            content="Rollback procedure for a failed API service deployment",
+            tags=["deployment"],
+        )
+        unrelated = storage.add_memory(
+            conn,
+            content="Recipe for a chocolate cake dessert",
+            tags=["cooking"],
+        )
+        storage.add_link(
+            conn,
+            seed["id"],
+            extension["id"],
+            edge_type="extends",
+            relation_confidence=0.9,
+            source="manual",
+        )
+
+        results = storage.hybrid_search(
+            conn,
+            "deploy API service",
+            top_k=5,
+            relationship_expansion=True,
+        )
+        by_id = {entry["memory"]["id"]: entry["memory"] for entry in results}
+        assert extension["id"] in by_id
+        assert by_id[extension["id"]]["relationship_context"] == [{
+            "from_id": seed["id"],
+            "edge_type": "extends",
+            "relation_confidence": 0.9,
+            "source": "manual",
+            "reason": None,
+        }]
+        # Unrelated memory may appear via base RRF (min_score=None in semantic leg),
+        # but it must NOT have relationship_context — expansion did not pull it.
+        if unrelated["id"] in by_id:
+            assert "relationship_context" not in by_id[unrelated["id"]], (
+                "unrelated memory should not have relationship_context"
+            )
+
+
 def test_hybrid_search_tags_all_filters_semantic_leg(local_db):
     """Phase 0 regression: tags_all must filter both legs of hybrid_search.
 

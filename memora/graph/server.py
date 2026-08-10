@@ -393,6 +393,138 @@ def start_graph_server(host: str, port: int) -> None:
             logger.exception("Graph actions API request failed: %s", e)
             return JSONResponse({"error": "internal_error"}, status_code=500)
 
+    async def api_duplicates(request: Request):
+        """API endpoint: Find duplicate candidate pairs from crossrefs.
+
+        Mirrors the Cloudflare functions/api/duplicates.ts implementation,
+        computed directly from memories + memories_crossrefs (no LLM).
+
+        Query params:
+          min_similarity=N — score floor (default 0.85)
+          limit=N          — max pairs (default 50, max 200)
+          tag=foo          — only pairs where both memories carry the tag
+
+        Response: { pairs: [{a, b, score, tier}], total, thresholds, min_similarity, limit, offset }
+        """
+        try:
+            params = request.query_params
+            try:
+                min_similarity = float(params.get("min_similarity", "0.85"))
+            except ValueError:
+                min_similarity = 0.85
+            min_similarity = min(1.0, max(0.0, min_similarity))
+            try:
+                limit = min(200, max(1, int(params.get("limit", "50"))))
+            except ValueError:
+                limit = 50
+            offset = 0
+            tag_filter = params.get("tag")
+
+            HIGH_THRESHOLD = 0.92
+            PREVIEW_CHARS = 200
+
+            conn = connect()
+            rows = conn.execute(
+                "SELECT id, content, metadata, tags, created_at FROM memories"
+            ).fetchall()
+            crossref_rows = conn.execute(
+                "SELECT memory_id, related FROM memories_crossrefs"
+            ).fetchall()
+            conn.close()
+
+            mem_by_id = {}
+            excluded = set()
+            for r in rows:
+                mem_by_id[r["id"]] = r
+                try:
+                    meta = json.loads(r["metadata"] or "{}")
+                except Exception:
+                    meta = {}
+                if meta.get("type") in ("section", "document_fragment"):
+                    excluded.add(r["id"])
+
+            def _tags(raw):
+                try:
+                    t = json.loads(raw or "[]")
+                    return t if isinstance(t, list) else []
+                except Exception:
+                    return []
+
+            def _preview(content):
+                if not content:
+                    return ""
+                if len(content) <= PREVIEW_CHARS:
+                    return content
+                return content[:PREVIEW_CHARS] + "\u2026"
+
+            pair_scores = {}
+            for cr in crossref_rows:
+                if cr["memory_id"] in excluded:
+                    continue
+                try:
+                    refs = json.loads(cr["related"] or "[]")
+                except Exception:
+                    continue
+                for ref in refs:
+                    if not isinstance(ref, dict) or not isinstance(ref.get("id"), int):
+                        continue
+                    if ref.get("edge_type") and ref.get("edge_type") != "related_to":
+                        continue
+                    if ref["id"] in excluded or ref["id"] == cr["memory_id"]:
+                        continue
+                    score = ref.get("score")
+                    if not isinstance(score, (int, float)):
+                        continue
+                    if score < min_similarity or score >= 0.9999:
+                        continue
+                    lo, hi = sorted((cr["memory_id"], ref["id"]))
+                    key = f"{lo}-{hi}"
+                    if key not in pair_scores or score > pair_scores[key]:
+                        pair_scores[key] = score
+
+            sorted_pairs = sorted(pair_scores.items(), key=lambda kv: kv[1], reverse=True)
+
+            pairs = []
+            for key, score in sorted_pairs:
+                lo, hi = map(int, key.split("-"))
+                a, b = mem_by_id.get(lo), mem_by_id.get(hi)
+                if not a or not b:
+                    continue
+                if tag_filter and not (
+                    tag_filter in _tags(a["tags"]) and tag_filter in _tags(b["tags"])
+                ):
+                    continue
+                pairs.append({
+                    "a": {
+                        "id": a["id"],
+                        "preview": _preview(a["content"]),
+                        "tags": _tags(a["tags"]),
+                        "created_at": a["created_at"],
+                    },
+                    "b": {
+                        "id": b["id"],
+                        "preview": _preview(b["content"]),
+                        "tags": _tags(b["tags"]),
+                        "created_at": b["created_at"],
+                    },
+                    "score": round(score, 4),
+                    "tier": "high" if score >= HIGH_THRESHOLD else "candidate",
+                })
+                if len(pairs) >= limit:
+                    break
+
+            return JSONResponse({
+                "pairs": pairs,
+                "total": len(pairs),
+                "thresholds": {"high": HIGH_THRESHOLD, "candidate": 0.85},
+                "min_similarity": min_similarity,
+                "limit": limit,
+                "offset": offset,
+            })
+        except Exception as e:
+            logger.exception("Graph duplicates API request failed: %s", e)
+            return JSONResponse({"error": "internal_error"}, status_code=500)
+
     async def graph_events(request: Request):
         """SSE endpoint for graph update notifications."""
         if not _check_origin(request):
@@ -779,6 +911,7 @@ def start_graph_server(host: str, port: int) -> None:
             return EventSourceResponse(event_generator())
 
         except Exception as e:
+            logger.exception("api_chat failed: %s", e)
             return JSONResponse({"error": "internal_error"}, status_code=500)
 
     app = Starlette(
@@ -792,6 +925,7 @@ def start_graph_server(host: str, port: int) -> None:
             Route("/api/memories/{id:int}", api_memory_patch, methods=["PATCH"]),
             Route("/api/memories/{id:int}/favorite", api_memory_patch, methods=["PATCH"]),
             Route("/api/actions", api_actions),
+            Route("/api/duplicates", api_duplicates),
             Route("/r2/{path:path}", r2_image_proxy),
         ]
     )

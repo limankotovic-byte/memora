@@ -37,6 +37,7 @@ from .storage import (
     find_invalid_tag_entries,
     generate_insights,
     get_crossrefs,
+    get_relationships,
     get_hierarchy_paths,
     get_memories_metadata_batch,
     get_memory,
@@ -401,10 +402,10 @@ def _find_invalid_tags(conn):
 def _get_related(conn, memory_id: int, refresh: bool) -> List[Dict[str, Any]]:
     if refresh:
         update_crossrefs(conn, memory_id)
-    refs = get_crossrefs(conn, memory_id)
+    refs = get_relationships(conn, memory_id)
     if not refs and not refresh:
         update_crossrefs(conn, memory_id)
-        refs = get_crossrefs(conn, memory_id)
+        refs = get_relationships(conn, memory_id)
     return refs
 
 
@@ -421,6 +422,7 @@ def _semantic_search(
     top_k: Optional[int],
     min_score: Optional[float],
     follow: Optional[str] = None,
+    relationship_expansion: bool = False,
 ):
     return semantic_search(
         conn,
@@ -429,6 +431,7 @@ def _semantic_search(
         top_k=top_k,
         min_score=min_score,
         follow=follow,
+        relationship_expansion=relationship_expansion,
     )
 
 
@@ -448,6 +451,7 @@ def _hybrid_search(
     follow: Optional[str] = None,
     rerank: bool = False,
     rerank_top_n: int = 40,
+    relationship_expansion: bool = False,
 ):
     return hybrid_search(
         conn,
@@ -464,6 +468,7 @@ def _hybrid_search(
         follow=follow,
         rerank=rerank,
         rerank_top_n=rerank_top_n,
+        relationship_expansion=relationship_expansion,
     )
 
 
@@ -713,7 +718,7 @@ def _build_memory_digest(
         for hop in range(1, min(include_related_hops, 3) + 1):
             next_frontier: List[int] = []
             for source_id in frontier:
-                for ref in get_crossrefs(conn, source_id):
+                for ref in get_relationships(conn, source_id):
                     edge_type = ref.get("edge_type", "related_to")
                     if edge_type in {"supersedes", "superseded_by"}:
                         continue
@@ -1971,6 +1976,7 @@ async def memory_semantic_search(
     preview_chars: int = 300,
     fields: Optional[List[str]] = None,
     follow: Optional[str] = None,
+    relationship_expansion: bool = False,
 ) -> Dict[str, Any]:
     """Perform a semantic search using vector embeddings.
 
@@ -1987,6 +1993,7 @@ async def memory_semantic_search(
                 omit "score" for flat list of memory dicts.
         follow: Lineage mode — "latest" resolves each result to its current version,
                 "active" excludes superseded memories, "full_history" expands supersession chains.
+        relationship_expansion: Expand top matches through one-hop explicit semantic edges.
     """
     try:
         validate_follow(follow)
@@ -2000,6 +2007,7 @@ async def memory_semantic_search(
             top_k,
             min_score,
             follow=follow,
+            relationship_expansion=relationship_expansion,
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
@@ -2038,6 +2046,7 @@ async def memory_hybrid_search(
     follow: Optional[str] = None,
     rerank: bool = False,
     rerank_top_n: int = 40,
+    relationship_expansion: bool = False,
 ) -> Dict[str, Any]:
     """Perform a hybrid search combining keyword (FTS) and semantic (vector) search.
 
@@ -2072,6 +2081,7 @@ async def memory_hybrid_search(
                 "active" excludes superseded memories, "full_history" expands supersession chains.
         rerank: Reorder fused results with the cross-encoder reranker (default: False)
         rerank_top_n: How many top fused candidates to rerank (default: 40)
+        relationship_expansion: Expand top matches through one-hop explicit semantic edges.
 
     Returns:
         Dictionary with count and list of results, each containing score and memory
@@ -2096,6 +2106,7 @@ async def memory_hybrid_search(
             follow,
             rerank,
             rerank_top_n,
+            relationship_expansion,
         )
     except ValueError as exc:
         return {"error": "invalid_filters", "message": str(exc)}
@@ -2327,8 +2338,26 @@ async def memory_boost(
 
 
 @_with_connection(writes=True)
-def _add_link(conn, from_id: int, to_id: int, edge_type: str, bidirectional: bool):
-    return add_link(conn, from_id, to_id, edge_type, bidirectional)
+def _add_link(
+    conn,
+    from_id: int,
+    to_id: int,
+    edge_type: str,
+    bidirectional: bool,
+    relation_confidence: Optional[float] = None,
+    source: str = "manual",
+    reason: Optional[str] = None,
+):
+    return add_link(
+        conn,
+        from_id,
+        to_id,
+        edge_type,
+        bidirectional,
+        relation_confidence,
+        source,
+        reason,
+    )
 
 
 @_with_connection(writes=True)
@@ -2347,6 +2376,9 @@ async def memory_link(
     to_id: int,
     edge_type: str = "references",
     bidirectional: bool = True,
+    relation_confidence: Optional[float] = None,
+    source: str = "manual",
+    reason: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create an explicit typed link between two memories.
 
@@ -2361,12 +2393,23 @@ async def memory_link(
             - "contradicts": Source conflicts with target
             - "related_to": Generic relationship
         bidirectional: If True, also create reverse link (default: True)
+        relation_confidence: Optional confidence in this relationship (0.0-1.0)
+        source: Origin of the relationship, such as manual, llm, or import
+        reason: Optional short explanation or evidence for the relationship
 
     Returns:
         Dict with created links and their types
     """
     try:
-        result = _add_link(from_id, to_id, edge_type, bidirectional)
+        result = _add_link(
+            from_id,
+            to_id,
+            edge_type,
+            bidirectional,
+            relation_confidence,
+            source,
+            reason,
+        )
         _schedule_cloud_graph_sync()
         return result
     except ValueError as e:

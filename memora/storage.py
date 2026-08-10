@@ -1021,29 +1021,97 @@ def _compute_embedding(
 _llm_client_cache: Dict[str, Any] = {}
 
 
+class _KeylessLLMResponse:
+    def __init__(self, text: str):
+        self.choices = [
+            type("_Choice", (), {"message": type("_Msg", (), {"content": text})()})()
+        ]
+
+
+class _KeylessLLMCompletions:
+    def __init__(self, base_url: str):
+        self._base_url = base_url
+
+    def create(self, model: str, messages: list, temperature: float = 0.1,
+               max_tokens: int = 2048, **kwargs) -> _KeylessLLMResponse:
+        import httpx
+        import time
+
+        last_error: Exception | None = None
+        max_attempts = 3
+        for attempt in range(max_attempts):
+            try:
+                with httpx.Client(timeout=20) as http:
+                    payload = {
+                        "model": model,
+                        "messages": messages,
+                        "temperature": temperature,
+                        "max_tokens": max_tokens,
+                    }
+                    reasoning_effort = os.getenv("MEMORA_LLM_REASONING_EFFORT")
+                    if reasoning_effort:
+                        payload["reasoning_effort"] = reasoning_effort
+                    resp = http.post(
+                        f"{self._base_url.rstrip('/')}/chat/completions",
+                        json=payload,
+                    )
+                    if resp.status_code in (429, 502, 503, 504):
+                        last_error = RuntimeError(
+                            f"upstream {resp.status_code}: {resp.text[:200]}"
+                        )
+                    else:
+                        resp.raise_for_status()
+                        content = resp.json()["choices"][0]["message"]["content"]
+                        return _KeylessLLMResponse(content)
+            except (httpx.HTTPError, KeyError) as e:
+                last_error = e
+
+            if attempt < max_attempts - 1:
+                time.sleep(2 ** attempt + 1)
+        raise last_error if last_error else RuntimeError("LLM request failed")
+
+
+class _KeylessLLMClient:
+    """OpenAI-compatible client that sends requests WITHOUT an Authorization header.
+
+    Needed for endpoints like opencode Zen (https://opencode.ai/zen/v1) which
+    reject any provided key but accept anonymous requests.
+    """
+
+    def __init__(self, base_url: str):
+        self._completions = _KeylessLLMCompletions(base_url)
+        self.chat = type("_Chat", (), {"completions": self._completions})()
+
+
+def _llm_instruction(task: str, output: str) -> str:
+    return (
+        f"{task} {output} "
+        "Do NOT think step by step. Do NOT include any reasoning. "
+        "Output the final answer immediately."
+    )
+
+
 def _get_llm_client():
     """Get or create cached LLM client for comparison."""
     if not LLM_ENABLED:
         return None
 
-    try:
-        import openai
+    if "llm_client" not in _llm_client_cache:
+        base_url = os.getenv("OPENAI_BASE_URL")
+        api_key = os.getenv("OPENAI_API_KEY", "")
+        if api_key:
+            import openai
 
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            return None
-
-        if "llm_client" not in _llm_client_cache:
-            base_url = os.getenv("OPENAI_BASE_URL")
             client_kwargs = {"api_key": api_key}
             if base_url:
                 client_kwargs["base_url"] = base_url
             _llm_client_cache["llm_client"] = openai.OpenAI(**client_kwargs)
+        elif base_url:
+            _llm_client_cache["llm_client"] = _KeylessLLMClient(base_url)
+        else:
+            return None
 
-        return _llm_client_cache["llm_client"]
-
-    except ImportError:
-        return None
+    return _llm_client_cache["llm_client"]
 
 
 def compare_memories_llm(
@@ -1098,11 +1166,11 @@ Respond with JSON only (no markdown):
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that compares text entries for semantic similarity. Always respond with valid JSON only."},
+                {"role": "system", "content": _llm_instruction("You compare text entries for semantic similarity.", "Respond with valid JSON only.")},
                 {"role": "user", "content": prompt}
             ],
-            temperature=0.1,
-            max_tokens=300,
+            temperature=0,
+            max_tokens=2048,
         )
 
         result_text = response.choices[0].message.content.strip()
@@ -1194,11 +1262,11 @@ Respond with JSON only (no markdown):
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
-                {"role": "system", "content": "You are a helpful assistant that classifies relationships between memory entries. Always respond with valid JSON only."},
+                {"role": "system", "content": _llm_instruction("You classify relationships between memory entries.", "Respond with valid JSON only.")},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.1,
-            max_tokens=600,
+            temperature=0,
+            max_tokens=2048,
         )
 
         result_text = response.choices[0].message.content.strip()
@@ -1250,6 +1318,7 @@ _REWRITE_SYSTEM_PROMPT = (
     "- For conversational/meta messages, return the original message as a single query\n\n"
     "Respond with JSON only (no markdown fences):\n"
     '{"queries": ["q1", "q2"], "filters": {"date_from": null, "date_to": null, "tags_any": null}}'
+    "\nDo NOT think step by step. Do NOT include any reasoning. Output the final JSON immediately."
 )
 
 
@@ -1283,7 +1352,7 @@ def rewrite_query(
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,
-            max_tokens=300,
+            max_tokens=2048,
         )
 
         result_text = response.choices[0].message.content.strip()
@@ -1524,7 +1593,7 @@ def find_supersession_candidates(
     """Find memory pairs that may have supersession relationships.
 
     Reuses find_duplicate_candidates with a lower threshold, then filters out
-    pairs that already have supersession edges.
+    pairs that already have durable supersession edges.
 
     Returns list of candidate pairs ordered by similarity, with newer/older
     determined by created_at timestamp.
@@ -1537,7 +1606,7 @@ def find_supersession_candidates(
         b_id = pair["memory_b_id"]
 
         # Skip pairs with existing supersession edges
-        refs_a = get_crossrefs(conn, a_id)
+        refs_a = get_explicit_edges(conn, a_id)
         has_edge = any(
             r.get("id") == b_id
             and r.get("edge_type") in ("supersedes", "superseded_by")
@@ -1676,6 +1745,9 @@ def detect_supersessions(
                 add_link(
                     conn, superseder["id"], superseded["id"],
                     edge_type="supersedes", bidirectional=True,
+                    relation_confidence=confidence,
+                    source="llm",
+                    reason=classification.get("reason"),
                 )
                 conn.commit()
                 applied = True
@@ -1956,6 +2028,53 @@ def _store_crossrefs(
     )
 
 
+def _validate_relation_confidence(value: Optional[float]) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("relation_confidence must be a number between 0 and 1") from exc
+    if not 0.0 <= confidence <= 1.0:
+        raise ValueError("relation_confidence must be between 0 and 1")
+    return confidence
+
+
+def get_explicit_edges(
+    conn: sqlite3.Connection,
+    memory_id: int,
+) -> List[Dict[str, Any]]:
+    """Return durable semantic edges originating from a memory."""
+    rows = conn.execute(
+        """
+        SELECT to_memory_id, relation_type, relation_confidence, source, reason, created_at
+        FROM memory_edges
+        WHERE from_memory_id = ?
+        ORDER BY id
+        """,
+        (memory_id,),
+    ).fetchall()
+    return [
+        {
+            "id": row["to_memory_id"],
+            "edge_type": row["relation_type"],
+            "relation_confidence": row["relation_confidence"],
+            "source": row["source"],
+            "reason": row["reason"],
+            "created_at": row["created_at"],
+        }
+        for row in rows
+    ]
+
+
+def get_relationships(
+    conn: sqlite3.Connection,
+    memory_id: int,
+) -> List[Dict[str, Any]]:
+    """Return computed similarity neighbours followed by durable typed edges."""
+    return get_crossrefs(conn, memory_id) + get_explicit_edges(conn, memory_id)
+
+
 def _store_crossrefs_bulk(
     conn: sqlite3.Connection,
     rows: List[Tuple[int, List[Dict[str, Any]]]],
@@ -2086,6 +2205,32 @@ def _update_crossrefs_for_memory(
 
 # Valid edge types for explicit links
 EDGE_TYPES = {"related_to", "supersedes", "contradicts", "implements", "extends", "references"}
+_REVERSE_EDGE_TYPES = {
+    "referenced_by", "implemented_by", "superseded_by", "extended_by",
+}
+_STORED_EDGE_TYPES = EDGE_TYPES | _REVERSE_EDGE_TYPES
+
+
+def _would_create_supersession_cycle(
+    conn: sqlite3.Connection,
+    superseder_id: int,
+    superseded_id: int,
+) -> bool:
+    """Return whether ``superseder -> superseded`` would close a version cycle."""
+    visited = {superseded_id}
+    queue = [superseded_id]
+    while queue:
+        current = queue.pop(0)
+        for edge in get_explicit_edges(conn, current):
+            if edge.get("edge_type") != "supersedes":
+                continue
+            target_id = edge.get("id")
+            if target_id == superseder_id:
+                return True
+            if target_id not in visited:
+                visited.add(target_id)
+                queue.append(target_id)
+    return False
 
 
 def add_link(
@@ -2094,20 +2239,35 @@ def add_link(
     to_id: int,
     edge_type: str = "references",
     bidirectional: bool = True,
+    relation_confidence: Optional[float] = None,
+    source: str = "manual",
+    reason: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Add an explicit link between two memories.
+    """Add a durable, explicit relationship between two memories.
 
     Args:
         from_id: Source memory ID
         to_id: Target memory ID
         edge_type: Type of relationship (references, implements, supersedes, contradicts, extends)
         bidirectional: If True, also create reverse link
+        relation_confidence: Optional confidence in this relationship (0.0-1.0)
+        source: Origin of the relationship (manual, llm, absorb, import, etc.)
+        reason: Optional concise evidence for the relationship
 
     Returns:
         Dict with status and created links
     """
+    edge_type = str(edge_type)
     if edge_type not in EDGE_TYPES:
         raise ValueError(f"Invalid edge_type '{edge_type}'. Must be one of: {', '.join(sorted(EDGE_TYPES))}")
+    if from_id == to_id:
+        raise ValueError("A memory cannot link to itself")
+    relation_confidence = _validate_relation_confidence(relation_confidence)
+    source = str(source or "manual").strip()
+    if not source:
+        raise ValueError("source must not be empty")
+    if reason is not None:
+        reason = str(reason).strip() or None
 
     # Verify both memories exist
     from_mem = get_memory(conn, from_id)
@@ -2117,25 +2277,47 @@ def add_link(
     if not to_mem:
         raise ValueError(f"Memory {to_id} not found")
 
+    if edge_type == "supersedes" and _would_create_supersession_cycle(conn, from_id, to_id):
+        raise ValueError("supersedes link would create a version cycle")
+
     links_created = []
 
-    # Add link from -> to
-    existing = get_crossrefs(conn, from_id)
-    # Remove any existing link to the same target
-    existing = [r for r in existing if r.get("id") != to_id]
-    # Add new link
-    existing.append({"id": to_id, "score": 1.0, "edge_type": edge_type})
-    _store_crossrefs(conn, from_id, existing)
-    links_created.append({"from": from_id, "to": to_id, "edge_type": edge_type})
+    def _upsert_edge(src: int, dst: int, relation: str) -> None:
+        conn.execute(
+            """
+            INSERT INTO memory_edges(
+                from_memory_id, to_memory_id, relation_type, relation_confidence, source, reason
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(from_memory_id, to_memory_id, relation_type) DO UPDATE SET
+                relation_confidence = COALESCE(excluded.relation_confidence, memory_edges.relation_confidence),
+                source = excluded.source,
+                reason = COALESCE(excluded.reason, memory_edges.reason)
+            """,
+            (src, dst, relation, relation_confidence, source, reason),
+        )
+
+    _upsert_edge(from_id, to_id, edge_type)
+    links_created.append({
+        "from": from_id,
+        "to": to_id,
+        "edge_type": edge_type,
+        "relation_confidence": relation_confidence,
+        "source": source,
+        "reason": reason,
+    })
 
     # Add reverse link if bidirectional
     if bidirectional:
         reverse_type = _get_reverse_edge_type(edge_type)
-        existing_reverse = get_crossrefs(conn, to_id)
-        existing_reverse = [r for r in existing_reverse if r.get("id") != from_id]
-        existing_reverse.append({"id": from_id, "score": 1.0, "edge_type": reverse_type})
-        _store_crossrefs(conn, to_id, existing_reverse)
-        links_created.append({"from": to_id, "to": from_id, "edge_type": reverse_type})
+        _upsert_edge(to_id, from_id, reverse_type)
+        links_created.append({
+            "from": to_id,
+            "to": from_id,
+            "edge_type": reverse_type,
+            "relation_confidence": relation_confidence,
+            "source": source,
+            "reason": reason,
+        })
 
     _log_action(conn, from_id, "link", f"Linked #{from_id} -> #{to_id} ({edge_type})")
     conn.commit()
@@ -2164,17 +2346,19 @@ def remove_link(
     """Remove a link between two memories."""
     removed = []
 
-    existing = get_crossrefs(conn, from_id)
-    new_refs = [r for r in existing if r.get("id") != to_id]
-    if len(new_refs) < len(existing):
-        _store_crossrefs(conn, from_id, new_refs)
+    cursor = conn.execute(
+        "DELETE FROM memory_edges WHERE from_memory_id = ? AND to_memory_id = ?",
+        (from_id, to_id),
+    )
+    if cursor.rowcount:
         removed.append({"from": from_id, "to": to_id})
 
     if bidirectional:
-        existing_reverse = get_crossrefs(conn, to_id)
-        new_refs_reverse = [r for r in existing_reverse if r.get("id") != from_id]
-        if len(new_refs_reverse) < len(existing_reverse):
-            _store_crossrefs(conn, to_id, new_refs_reverse)
+        cursor = conn.execute(
+            "DELETE FROM memory_edges WHERE from_memory_id = ? AND to_memory_id = ?",
+            (to_id, from_id),
+        )
+        if cursor.rowcount:
             removed.append({"from": to_id, "to": from_id})
 
     if removed:
@@ -2243,7 +2427,7 @@ def _walk_chain(
     while queue and depth < max_depth:
         next_queue: List[int] = []
         for current in queue:
-            refs = get_crossrefs(conn, current)
+            refs = get_explicit_edges(conn, current)
             for ref in refs:
                 rid = ref["id"]
                 if (ref.get("edge_type") == edge_type
@@ -2272,7 +2456,7 @@ def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
     all_ids_set = set(all_ids)
     leaves = []
     for mid in all_ids:
-        refs = get_crossrefs(conn, mid)
+        refs = get_explicit_edges(conn, mid)
         has_successor = any(
             ref.get("edge_type") == "superseded_by"
             and ref["id"] in all_ids_set
@@ -2291,7 +2475,7 @@ def _resolve_latest(conn: sqlite3.Connection, memory_id: int) -> List[int]:
 
 def _is_superseded(conn: sqlite3.Connection, memory_id: int) -> bool:
     """Check if a memory has been superseded by an existing memory."""
-    refs = get_crossrefs(conn, memory_id)
+    refs = get_explicit_edges(conn, memory_id)
     for ref in refs:
         if ref.get("edge_type") == "superseded_by" and _memory_exists(conn, ref["id"]):
             return True
@@ -2309,7 +2493,7 @@ def _get_full_history(conn: sqlite3.Connection, memory_id: int) -> List[int]:
     # The roots are the leaves of the backward walk
     roots: set[int] = set()
     for mid in ancestors:
-        refs = get_crossrefs(conn, mid)
+        refs = get_explicit_edges(conn, mid)
         has_parent = any(
             ref.get("edge_type") == "supersedes"
             and ref["id"] not in {mid}
@@ -2428,6 +2612,124 @@ def apply_follow(
         return out
 
     return results
+
+
+_RELATIONSHIP_EXPANSION_WEIGHTS = {
+    "extends": 0.18,
+    "implements": 0.15,
+    "references": 0.08,
+    "related_to": 0.05,
+    "contradicts": 0.06,
+}
+
+
+def _relationship_confidence(edge: Dict[str, Any]) -> float:
+    value = edge.get("relation_confidence")
+    if value is None:
+        return 0.5 if edge.get("source") == "legacy_migration" else 1.0
+    try:
+        return min(1.0, max(0.0, float(value)))
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def apply_relationship_expansion(
+    conn: sqlite3.Connection,
+    results: List[Dict[str, Any]],
+    *,
+    top_k: int,
+    follow: Optional[str] = None,
+    seed_limit: int = 5,
+) -> List[Dict[str, Any]]:
+    """Expand top search hits through one hop of durable semantic edges.
+
+    Expanded memories are added **on top of** the base ``top_k`` results, not
+    competing for the same slots.  This guarantees that explicitly linked
+    context reaches the caller even when its base retrieval score is low.
+
+    Computed embedding neighbours are intentionally excluded.  The expansion
+    carries explicit provenance in ``relationship_context``.  Supersession
+    stays exclusively in the lineage policy handled by ``follow``.
+    """
+    if not results or top_k <= 0:
+        return results
+
+    base_ids: List[int] = []
+    by_id: Dict[int, Dict[str, Any]] = {}
+    base_scores: Dict[int, float] = {}
+    for item in results:
+        memory = item.get("memory", item)
+        if not isinstance(memory, dict) or "id" not in memory:
+            continue
+        memory_id = memory["id"]
+        base_ids.append(memory_id)
+        by_id[memory_id] = memory
+        base_scores[memory_id] = float(item.get("score", 0.0))
+
+    # Keep base results in their original order, trimmed to top_k
+    base_ids = base_ids[:top_k]
+
+    seed_ids = base_ids[:seed_limit]
+    expanded_ids: List[int] = []
+    expanded_scores: Dict[int, float] = {}
+
+    for seed_id in seed_ids:
+        seed_score = base_scores.get(seed_id, 0.0)
+        for edge in get_explicit_edges(conn, seed_id):
+            edge_type = edge.get("edge_type")
+            weight = _RELATIONSHIP_EXPANSION_WEIGHTS.get(edge_type)
+            if weight is None:
+                continue
+            target_id = edge.get("id")
+            if target_id is None:
+                continue
+
+            # Resolve target through follow policy
+            if target_id not in by_id:
+                if follow == "active" and _is_superseded(conn, target_id):
+                    continue
+                if follow == "latest":
+                    target_ids = _resolve_latest(conn, target_id)
+                    target_id = max(target_ids)
+                if target_id not in by_id:
+                    target = _serialise_memory_for_follow(conn, target_id)
+                    if not target:
+                        continue
+                    by_id[target_id] = target
+
+            target = by_id[target_id]
+            confidence = _relationship_confidence(edge)
+            contribution = seed_score * weight * confidence
+            expanded_scores[target_id] = expanded_scores.get(target_id, 0.0) + contribution
+
+            context = {
+                "from_id": seed_id,
+                "edge_type": edge_type,
+                "relation_confidence": edge.get("relation_confidence"),
+                "source": edge.get("source"),
+                "reason": edge.get("reason"),
+            }
+            contexts = target.setdefault("relationship_context", [])
+            if context not in contexts:
+                contexts.append(context)
+
+            # Track truly new expanded targets (not already in base results)
+            if target_id not in base_scores and target_id not in expanded_ids:
+                expanded_ids.append(target_id)
+
+    # Build output: base results first (in original rank order), then expanded
+    # targets sorted by their expansion contribution
+    out: List[Dict[str, Any]] = []
+    for memory_id in base_ids:
+        score = base_scores[memory_id] + expanded_scores.get(memory_id, 0.0)
+        out.append({"score": round(score, 4), "memory": by_id[memory_id]})
+
+    expanded_ids.sort(key=lambda mid: expanded_scores.get(mid, 0.0), reverse=True)
+    for memory_id in expanded_ids:
+        score = expanded_scores.get(memory_id, 0.0)
+        out.append({"score": round(score, 4), "memory": by_id[memory_id]})
+
+    return out
 
 
 def _louvain_communities(
@@ -2706,6 +3008,9 @@ def _update_crossrefs(conn: sqlite3.Connection, memory_id: int) -> None:
 def rebuild_crossrefs(conn: sqlite3.Connection) -> int:
     """Recompute every memory's score-based crossrefs.
 
+    Explicit semantic edges are stored separately in ``memory_edges`` and are
+    intentionally untouched by this rebuild.
+
     Optimized path: pull all (id, metadata, embedding) rows ONCE via the
     paginated JOIN helper, compute the all-pairs cosine matrix in pure
     Python, then write each memory's top-K crossrefs in a single pass.
@@ -2828,6 +3133,13 @@ def _remove_memory_from_crossrefs(conn: sqlite3.Connection, memory_id: int) -> N
         filtered = [entry for entry in related if entry.get("id") != memory_id]
         if len(filtered) != len(related):
             _store_crossrefs(conn, row["memory_id"], filtered)
+
+
+def _remove_memory_edges(conn: sqlite3.Connection, memory_id: int) -> None:
+    conn.execute(
+        "DELETE FROM memory_edges WHERE from_memory_id = ? OR to_memory_id = ?",
+        (memory_id, memory_id),
+    )
 
 
 def add_memory(
@@ -3032,6 +3344,16 @@ ABSORB_ACTIONS = {"created", "superseded", "contradicted", "linked", "skipped"}
 # Similarity thresholds for absorb classification
 _ABSORB_DUPLICATE_THRESHOLD = 0.85  # No-LLM auto-skip: must be very high confidence
 _ABSORB_RELATED_THRESHOLD = 0.35    # Send to LLM for classification
+def _absorb_supersession_confidence() -> float:
+    raw = os.getenv("MEMORA_ABSORB_SUPERSESSION_CONFIDENCE")
+    if raw is not None:
+        try:
+            value = float(raw)
+            if 0.0 <= value <= 1.0:
+                return value
+        except (TypeError, ValueError):
+            pass
+    return 0.7
 
 
 def _classify_fact_against_matches(
@@ -3041,7 +3363,7 @@ def _classify_fact_against_matches(
     """Use LLM to classify how a fact relates to existing memories.
 
     Returns (classifications, suggested_tags) where:
-    - classifications: list of {memory_id, relationship, reason} dicts
+    - classifications: list of {memory_id, relationship, confidence, reason} dicts
     - suggested_tags: list of project-prefixed tag strings
     """
     client = _get_llm_client()
@@ -3049,7 +3371,7 @@ def _classify_fact_against_matches(
         return [], []
 
     match_descriptions = "\n".join(
-        f'  {i+1}. [#{m["id"]}] "{m["content"][:300]}" (similarity: {m.get("score", 0):.2f}, tags: {m.get("tags", [])})'
+        f'  {i+1}. [#{m["id"]}] "{m["content"][:150]}" (similarity: {m.get("score", 0):.2f}, tags: {m.get("tags", [])})'
         for i, m in enumerate(matches)
     )
 
@@ -3069,21 +3391,21 @@ For each memory, classify the relationship:
 - RELATED: different aspect of same topic
 - UNRELATED: false positive similarity match
 
-Also suggest 1-3 project-prefixed tags for the new fact (e.g. "memora/research", "clmux/architecture").
+Also suggest 1-2 project-prefixed tags for the new fact (e.g. "memora/research", "clmux/architecture").
 Use tags from the matched memories as guidance. Avoid generic single-word tags.
 
-Respond with JSON only (no markdown):
-{{"classifications": [{{"memory_id": <id>, "relationship": "<type>", "reason": "<brief reason>"}}], "suggested_tags": ["tag1", "tag2"]}}"""
+Respond with JSON only (no markdown), keep every reason under 15 words:
+{{"classifications": [{{"memory_id": <id>, "relationship": "<type>", "confidence": 0.0, "reason": "<brief reason>"}}], "suggested_tags": ["tag1", "tag2"]}}"""
 
     try:
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
-                {"role": "system", "content": "You classify relationships between text entries and suggest tags. Always respond with valid JSON only."},
+                {"role": "system", "content": _llm_instruction("You classify relationships between text entries and suggest tags.", "Respond with valid JSON only.")},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.1,
-            max_tokens=600,
+            temperature=0,
+            max_tokens=2048,
         )
         result_text = response.choices[0].message.content.strip()
         # Strip markdown code fences if present
@@ -3126,8 +3448,13 @@ Respond with JSON only (no markdown):
                 except (ValueError, TypeError):
                     continue
             if rel in valid_rels and mid in valid_ids:
+                try:
+                    relation_confidence = float(cls.get("confidence", 0.5))
+                except (TypeError, ValueError):
+                    relation_confidence = 0.5
                 cls["relationship"] = rel
                 cls["memory_id"] = mid  # ensure int after coercion
+                cls["confidence"] = min(1.0, max(0.0, relation_confidence))
                 validated.append(cls)
         return validated, suggested_tags
     except Exception as e:
@@ -3163,11 +3490,11 @@ Respond with the merged text only (no quotes, no preamble)."""
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[
-                {"role": "system", "content": "You merge related facts into concise, information-dense summaries. Respond with the merged text only."},
+                {"role": "system", "content": _llm_instruction("You merge related facts into concise, information-dense summaries.", "Respond with the merged text only.")},
                 {"role": "user", "content": prompt},
             ],
-            temperature=0.1,
-            max_tokens=500,
+            temperature=0,
+            max_tokens=2048,
         )
         result = response.choices[0].message.content.strip()
         if result and len(result) >= 10:
@@ -3329,7 +3656,12 @@ def absorb_memory(
         # to create rather than silently dropping knowledge.
         if not classifications and matches:
             # Create with related_to link to preserve knowledge
-            pending_creates.append((fact, vector, ("related_to", top_mem["id"], "LLM classify empty; preserving as related"), suggested_tags))
+            pending_creates.append((
+                fact,
+                vector,
+                ("related_to", top_mem["id"], "LLM classify empty; preserving as related", None),
+                suggested_tags,
+            ))
             counts["linked"] += 1
             continue
 
@@ -3339,6 +3671,7 @@ def absorb_memory(
             rel = cls.get("relationship", "").upper()
             target_id = cls.get("memory_id")
             reason = cls.get("reason", "")
+            relation_confidence = cls.get("confidence", 0.5)
 
             if rel == "DUPLICATE":
                 decisions.append({
@@ -3352,22 +3685,50 @@ def absorb_memory(
                 break
 
             elif rel == "UPDATE":
-                # Queue for creation with supersedes link
-                pending_creates.append((fact, vector, ("supersedes", target_id, reason), suggested_tags))
-                counts["superseded"] += 1
+                if relation_confidence >= _absorb_supersession_confidence():
+                    pending_creates.append((
+                        fact,
+                        vector,
+                        ("supersedes", target_id, reason, relation_confidence),
+                        suggested_tags,
+                    ))
+                    counts["superseded"] += 1
+                else:
+                    pending_creates.append((
+                        fact,
+                        vector,
+                        (
+                            "related_to",
+                            target_id,
+                            f"Possible update below supersession threshold: {reason}",
+                            relation_confidence,
+                        ),
+                        suggested_tags,
+                    ))
+                    counts["linked"] += 1
                 action_taken = True
                 break
 
             elif rel == "CONTRADICT":
                 # Queue for creation with contradicts link
-                pending_creates.append((fact, vector, ("contradicts", target_id, reason), suggested_tags))
+                pending_creates.append((
+                    fact,
+                    vector,
+                    ("contradicts", target_id, reason, relation_confidence),
+                    suggested_tags,
+                ))
                 counts["contradicted"] += 1
                 action_taken = True
                 break
 
             elif rel == "RELATED":
                 # Queue for creation with related_to link
-                pending_creates.append((fact, vector, ("related_to", target_id, reason), suggested_tags))
+                pending_creates.append((
+                    fact,
+                    vector,
+                    ("related_to", target_id, reason, relation_confidence),
+                    suggested_tags,
+                ))
                 counts["linked"] += 1
                 action_taken = True
                 break
@@ -3451,7 +3812,7 @@ def absorb_memory(
 
     # Create memories with links (supersedes/contradicts/related)
     for _, (fact, vector, link_info, fact_suggested) in linkable:
-        edge_type, target_id, reason = link_info
+        edge_type, target_id, reason, relation_confidence = link_info
         action_label = {"supersedes": "superseded", "contradicts": "contradicted", "related_to": "linked"}[edge_type]
 
         final_tags = _merge_tags(tags, _filter_suggested_tags(fact_suggested))
@@ -3460,7 +3821,15 @@ def absorb_memory(
         else:
             record = add_memory(conn, content=fact, metadata=merged_meta, tags=final_tags)
             try:
-                add_link(conn, record["id"], target_id, edge_type=edge_type)
+                add_link(
+                    conn,
+                    record["id"],
+                    target_id,
+                    edge_type=edge_type,
+                    relation_confidence=relation_confidence,
+                    source="absorb",
+                    reason=reason,
+                )
             except (ValueError, Exception) as link_err:
                 logger.warning("Absorb link failed (memory #%d -> #%d): %s", record["id"], target_id, link_err)
             conn.commit()
@@ -3663,7 +4032,7 @@ def get_memory(
         conn.commit()
 
     record = _serialise_row(row)
-    record["related"] = get_crossrefs(conn, memory_id)
+    record["related"] = get_relationships(conn, memory_id)
 
     if follow == "full_history":
         chain_ids = _get_full_history(conn, memory_id)
@@ -3787,7 +4156,7 @@ def update_memory(
 
     # Get crossrefs - these were just updated so might also be stale,
     # but the semantic content matters more for consistency
-    result["related"] = get_crossrefs(conn, memory_id)
+    result["related"] = get_relationships(conn, memory_id)
 
     return result
 
@@ -3815,6 +4184,7 @@ def delete_memory(conn: sqlite3.Connection, memory_id: int) -> bool:
     _delete_embedding(conn, memory_id)
     _clear_crossrefs(conn, memory_id)
     _remove_memory_from_crossrefs(conn, memory_id)
+    _remove_memory_edges(conn, memory_id)
     _log_action(conn, memory_id, "delete", f"Deleted memory #{memory_id}")
     cur = conn.execute("DELETE FROM memories WHERE id = ?", (memory_id,))
     conn.commit()
@@ -3846,6 +4216,7 @@ def delete_memories(conn: sqlite3.Connection, memory_ids: Iterable[int]) -> int:
         _delete_embedding(conn, memory_id)
         _clear_crossrefs(conn, memory_id)
         _remove_memory_from_crossrefs(conn, memory_id)
+        _remove_memory_edges(conn, memory_id)
     for memory_id in ids:
         _log_action(conn, memory_id, "delete", f"Deleted memory #{memory_id}")
     for i in range(0, len(ids), 50):
@@ -4152,6 +4523,7 @@ def semantic_search(
     tags_all: Optional[List[str]] = None,
     tags_none: Optional[List[str]] = None,
     follow: Optional[str] = None,
+    relationship_expansion: bool = False,
 ) -> List[Dict[str, Any]]:
     """Perform semantic search using vector embeddings.
 
@@ -4169,6 +4541,7 @@ def semantic_search(
         tags_none: Exclude memories with ANY of these tags (NOT)
         follow: Lineage mode — "latest" (resolve to current version),
                 "active" (exclude superseded), "full_history" (expand chains)
+        relationship_expansion: Expand top matches through one-hop explicit edges
 
     Returns:
         List of results with score and memory
@@ -4203,6 +4576,14 @@ def semantic_search(
         if follow == "full_history" and top_k is not None and len(results) > top_k * 3:
             results = results[:top_k * 3]
 
+    if relationship_expansion:
+        results = apply_relationship_expansion(
+            conn,
+            results,
+            top_k=top_k or len(results),
+            follow=follow,
+        )
+
     return results
 
 
@@ -4223,6 +4604,7 @@ def hybrid_search(
     follow: Optional[str] = None,
     rerank: bool = False,
     rerank_top_n: int = 40,
+    relationship_expansion: bool = False,
 ) -> List[Dict[str, Any]]:
     """Combine FTS keyword search and semantic vector search using Reciprocal Rank Fusion.
 
@@ -4242,6 +4624,7 @@ def hybrid_search(
         rerank: If True, reorder fused candidates with a cross-encoder reranker
                 (see memora.reranker). Scores keep the RRF scale; only order changes.
         rerank_top_n: How many top fused candidates to pass to the reranker
+        relationship_expansion: Expand top matches through one-hop explicit edges
 
     Returns:
         List of memories with combined scores, sorted by relevance
@@ -4342,6 +4725,14 @@ def hybrid_search(
         results = apply_follow(conn, results, follow, is_search=True)
         if follow == "full_history" and len(results) > top_k * 3:
             results = results[:top_k * 3]
+
+    if relationship_expansion:
+        results = apply_relationship_expansion(
+            conn,
+            results,
+            top_k=top_k,
+            follow=follow,
+        )
 
     return results
 
@@ -4697,12 +5088,12 @@ Respond with JSON only (no markdown):
             messages=[
                 {
                     "role": "system",
-                    "content": "You are a knowledge management analyst. Analyze memory entries and provide actionable insights. Always respond with valid JSON only.",
+                    "content": _llm_instruction("You are a knowledge management analyst. Analyze memory entries and provide actionable insights.", "Respond with valid JSON only."),
                 },
                 {"role": "user", "content": prompt},
             ],
             temperature=0.2,
-            max_tokens=1200,
+            max_tokens=2048,
         )
 
         result_text = response.choices[0].message.content.strip()

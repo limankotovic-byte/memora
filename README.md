@@ -35,7 +35,7 @@ An MCP memory layer for agents: structured storage, semantic retrieval, graph re
 **Search & Intelligence**
 - 🔍 **Semantic Search** - Vector embeddings (TF-IDF, sentence-transformers, OpenAI)
 - 🎯 **Advanced Queries** - Full-text, date ranges, tag filters (AND/OR/NOT), hybrid search
-- 🔀 **Cross-references** - Auto-linked related memories based on similarity
+- 🔀 **Similarity & Semantic Edges** - Rebuildable similarity neighbours plus durable typed relationships
 - 🤖 **LLM Deduplication** - Find and merge duplicates with AI-powered comparison
 - 🔗 **Memory Linking** - Typed edges, importance boosting, and cluster detection
 
@@ -214,7 +214,7 @@ Memora supports three embedding backends:
 | `sentence-transformers` | `pip install memora[local]` | Good, runs offline | Medium |
 | `tfidf` | Included | Basic keyword matching | Fast |
 
-**Automatic:** Embeddings and cross-references are computed automatically when you `memory_create`, `memory_update`, or `memory_create_batch`.
+**Automatic:** Embeddings and similarity cross-references are computed automatically when you `memory_create`, `memory_update`, or `memory_create_batch`. Explicit semantic edges are stored separately and are never changed by a cross-reference rebuild.
 
 **Manual rebuild required** when:
 - Changing `MEMORA_EMBEDDING_MODEL` after memories exist
@@ -483,8 +483,15 @@ Returns:
 Manage relationships between memories:
 
 ```python
-# Create typed edges between memories
-memory_link(from_id=1, to_id=2, edge_type="implements", bidirectional=True)
+# Create a durable typed edge between memories
+memory_link(
+    from_id=1,
+    to_id=2,
+    edge_type="implements",
+    relation_confidence=0.95,
+    source="manual",
+    reason="Implementation realizes the approved design",
+)
 
 # Edge types: references, implements, supersedes, extends, contradicts, related_to
 
@@ -497,6 +504,21 @@ memory_boost(memory_id=42, boost_amount=0.5)
 # Detect clusters of related memories
 memory_clusters(min_cluster_size=2, min_score=0.3)
 ```
+
+Explicit edges persist through `memory_rebuild_crossrefs`. They store the relationship type, optional confidence, source, reason, and creation timestamp. The similarity graph remains a separate rebuildable cache.
+
+Use relationship-aware retrieval when confirmed relationships should add focused context to search results:
+
+```python
+memory_hybrid_search(
+    query="deploy the API safely",
+    follow="active",
+    rerank=True,
+    relationship_expansion=True,
+)
+```
+
+Expansion follows only one hop of explicit `extends`, `implements`, `references`, `related_to`, and `contradicts` edges. It never expands through embedding-similarity neighbours; `supersedes` is handled by the `follow` lineage policy.
 
 </details>
 
