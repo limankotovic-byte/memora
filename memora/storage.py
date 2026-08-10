@@ -1041,7 +1041,7 @@ class _KeylessLLMCompletions:
         max_attempts = 3
         for attempt in range(max_attempts):
             try:
-                with httpx.Client(timeout=20) as http:
+                with httpx.Client(timeout=60) as http:
                     payload = {
                         "model": model,
                         "messages": messages,
