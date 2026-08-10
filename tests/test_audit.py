@@ -63,3 +63,23 @@ def test_load_crossref_candidates_ignores_self_pairs(local_db):
 
         candidates = audit._load_crossref_candidates(conn, min_score=0.8, max_pairs=10)
         assert candidates == []
+
+
+def test_link_prompt_offers_supersedes():
+    """The LLM prompt must include strict supersession relations."""
+    prompt = audit._link_prompt("memory a", "memory b")
+    assert "a_supersedes_b" in prompt
+    assert "b_supersedes_a" in prompt
+    assert "fully obsolete" in prompt
+    assert "neither" in prompt
+
+
+def test_wide_flag_lowers_threshold_and_raises_limit():
+    """--wide is a shortcut for the monthly sweep (0.55, up to 60 pairs);
+    explicit flags always win."""
+    wide = audit._resolve_defaults(wide=True, min_score=None, limit=None)
+    assert wide == (0.55, 60)
+    plain = audit._resolve_defaults(wide=False, min_score=None, limit=None)
+    assert plain == (0.80, 40)
+    explicit = audit._resolve_defaults(wide=True, min_score=0.9, limit=5)
+    assert explicit == (0.9, 5)

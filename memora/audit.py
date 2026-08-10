@@ -16,6 +16,7 @@ which is keyless).  Suitable for a weekly systemd timer or cron job.
 Example:
     memora-audit-edges --dry-run            # preview what would be linked
     memora-audit-edges --min-score 0.85     # stricter similarity threshold
+    memora-audit-edges --wide --dry-run     # monthly supersession sweep (0.55)
 """
 
 import argparse
@@ -33,6 +34,7 @@ LOCK_FILE = Path("/tmp/memora_audit_edges.lock")
 # ---------------------------------------------------------------------------
 # Single-instance lock
 # ---------------------------------------------------------------------------
+
 
 def _acquire_lock() -> bool:
     global _lock_fd
@@ -52,6 +54,7 @@ def _acquire_lock() -> bool:
 # ---------------------------------------------------------------------------
 # Desktop notifications (optional, best-effort)
 # ---------------------------------------------------------------------------
+
 
 def _notify(msg: str) -> None:
     try:
@@ -116,12 +119,11 @@ def _force_ipv4() -> None:
 # Core logic
 # ---------------------------------------------------------------------------
 
+
 def _load_crossref_candidates(conn, min_score: float, max_pairs: int):
     """Return (from_id, to_id, score) pairs from crossrefs above min_score,
     skipping pairs already present in memory_edges."""
-    rows = conn.execute(
-        "SELECT memory_id, related FROM memories_crossrefs WHERE related IS NOT NULL"
-    )
+    rows = conn.execute("SELECT memory_id, related FROM memories_crossrefs WHERE related IS NOT NULL")
     crossrefs = [(r["memory_id"], r["related"]) for r in rows]
 
     linked = {
@@ -174,7 +176,14 @@ def _link_prompt(content_a: str, content_b: str) -> str:
         "---\n"
         'Valid relations: "related_to" (same topic, distinct value), '
         '"references" (A points to B), "extends" (A builds on B), '
-        '"implements" (A realizes B), "neither" (not meaningfully related).\n'
+        '"implements" (A realizes B), '
+        '"a_supersedes_b" (A is a strictly newer version of B covering the same '
+        "scope with updated information, making B fully obsolete), "
+        '"b_supersedes_a" (the reverse: B makes A fully obsolete), '
+        '"neither" (not meaningfully related).\n'
+        "Supersession is STRICT: one memory must make the other fully obsolete "
+        "for active retrieval; it is NOT overlap, refinement, or partial update. "
+        "When in doubt, prefer a plain link over supersession.\n"
         'Prefer "neither" when in doubt; only pick a link for genuinely connected entries.\n'
         "Respond with JSON only (no markdown):\n"
         '{"relation": "<one of the above>", "confidence": 0.0-1.0, '
@@ -214,11 +223,20 @@ def _classify_pair(client, content_a: str, content_b: str):
     )
 
 
+def _resolve_defaults(wide: bool, min_score: float | None, limit: int | None) -> tuple[float, int]:
+    """Resolve similarity threshold and pair limit.
+
+    --wide is a shortcut for the monthly supersession sweep (0.55, 60 pairs);
+    explicit --min-score/--limit values always win.
+    """
+    if wide:
+        return (min_score if min_score is not None else 0.55, limit if limit is not None else 60)
+    return (min_score if min_score is not None else 0.80, limit if limit is not None else 40)
+
+
 def main(argv=None) -> int:
     # Standalone defaults; explicit env values always win.
-    os.environ.setdefault(
-        "MEMORA_DB_PATH", str(Path.home() / ".local/share/memora/memories.db")
-    )
+    os.environ.setdefault("MEMORA_DB_PATH", str(Path.home() / ".local/share/memora/memories.db"))
     os.environ.setdefault("OPENAI_BASE_URL", "https://opencode.ai/zen/v1")
     os.environ.setdefault("MEMORA_LLM_MODEL", "deepseek-v4-flash-free")
     os.environ.setdefault("MEMORA_LLM_ENABLED", "true")
@@ -226,25 +244,24 @@ def main(argv=None) -> int:
     log_file = Path(os.environ["MEMORA_DB_PATH"]).parent / "audit_edges.log"
 
     parser = argparse.ArgumentParser(
-        description=(
-            "Audit similar memory pairs and promote them to explicit, durable "
-            "edges (LLM-confirmed)."
-        )
+        description=("Audit similar memory pairs and promote them to explicit, durable edges (LLM-confirmed).")
     )
     parser.add_argument("--dry-run", action="store_true", help="Do not write anything")
     parser.add_argument(
-        "--min-score", type=float, default=0.80, help="Crossref similarity threshold"
+        "--wide",
+        action="store_true",
+        help=(
+            "Wide monthly pass: lower similarity threshold (0.55, catches "
+            "supersessions among distant pairs) and a larger pair limit"
+        ),
     )
-    parser.add_argument(
-        "--limit", type=int, default=40, help="Max pairs to classify per run"
-    )
-    parser.add_argument(
-        "--confidence", type=float, default=0.8, help="Min LLM confidence to link"
-    )
-    parser.add_argument(
-        "--no-ipv4", action="store_true", help="Do not force IPv4 resolution"
-    )
+    parser.add_argument("--min-score", type=float, default=None, help="Crossref similarity threshold")
+    parser.add_argument("--limit", type=int, default=None, help="Max pairs to classify per run")
+    parser.add_argument("--confidence", type=float, default=0.8, help="Min LLM confidence to link")
+    parser.add_argument("--no-ipv4", action="store_true", help="Do not force IPv4 resolution")
     args = parser.parse_args(argv)
+
+    args.min_score, args.limit = _resolve_defaults(args.wide, args.min_score, args.limit)
 
     if not _acquire_lock():
         print("another audit_edges run is in progress; exiting")
@@ -256,10 +273,11 @@ def main(argv=None) -> int:
         handlers=[logging.StreamHandler(), logging.FileHandler(log_file)],
     )
     logging.info(
-        "=== audit_edges run: min_score=%.2f limit=%d dry_run=%s ===",
+        "=== audit_edges run: min_score=%.2f limit=%d dry_run=%s wide=%s ===",
         args.min_score,
         args.limit,
         args.dry_run,
+        args.wide,
     )
 
     if not args.no_ipv4:
@@ -323,6 +341,15 @@ def main(argv=None) -> int:
             )
             skipped += 1
             continue
+
+        # Directional relations: a_supersedes_b links from_id -> to_id,
+        # b_supersedes_a links to_id -> from_id. Undirected relations are
+        # stored identically in both directions by add_link().
+        if relation == "b_supersedes_a":
+            from_id, to_id = to_id, from_id
+            relation = "supersedes"
+        elif relation == "a_supersedes_b":
+            relation = "supersedes"
 
         if args.dry_run:
             logging.info(

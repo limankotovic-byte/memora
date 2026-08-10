@@ -415,21 +415,25 @@ memora-audit-edges --dry-run
 # Real run: top similar pairs, LLM decides, writes explicit edges
 memora-audit-edges --limit 40 --min-score 0.80
 
+# Monthly supersession sweep: catches "A replaced B" among less similar pairs
+memora-audit-edges --wide --dry-run
+
 # Or via uv directly from the repo
 uv run python scripts/audit_edges.py --dry-run
 ```
 
 **Why:** similarity hits in `memories_crossrefs` are a rebuildable cache ("looks similar"), while `memory_edges` are durable, typed relationships ("confirmed related") that drive relationship expansion in search. Confirming every pair would need O(n²) LLM calls, so the auditor checks only the strongest candidates each run.
 
-**How it works:** takes crossref pairs with `score >= --min-score` that are not yet in `memory_edges`, asks the LLM whether they are genuinely related (and how: `related_to` / `references` / `extends` / `implements`), and writes edges with `--confidence`-filtered, human-readable reasons via `add_link()`.
+**How it works:** takes crossref pairs with `score >= --min-score` that are not yet in `memory_edges`, asks the LLM whether they are genuinely related (and how: `related_to` / `references` / `extends` / `implements` / `a_supersedes_b` / `b_supersedes_a`), and writes edges with `--confidence`-filtered, human-readable reasons via `add_link()`. Supersession is strict — one memory must make the other fully obsolete — so it is offered on every run (at `>= 0.80` pairs are near-duplicates); `--wide` broadens the sweep to catch supersessions among distant pairs. The same model handles absorb-time classification in the MCP — one LLM, two triggers (inline + timer).
 
 **Options:**
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--dry-run` | off | Log only, write nothing |
-| `--min-score` | 0.80 | Crossref similarity threshold |
-| `--limit` | 40 | Max pairs classified per run |
+| `--wide` | off | Monthly sweep: threshold 0.55, up to 60 pairs (explicit `--min-score`/`--limit` win) |
+| `--min-score` | 0.80 (0.55 with `--wide`) | Crossref similarity threshold |
+| `--limit` | 40 (60 with `--wide`) | Max pairs classified per run |
 | `--confidence` | 0.80 | Min LLM confidence to accept a link |
 | `--no-ipv4` | off | Disable IPv4-forced DNS resolution |
 
