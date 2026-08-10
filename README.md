@@ -403,6 +403,72 @@ Runs in two phases: embedding-similarity candidates → LLM classification (neut
 
 </details>
 
+<details id="edge-auditor">
+<summary><big><big><strong>Edge Auditor (CLI)</strong></big></big></summary>
+
+Automatically promote similar memory pairs into durable, LLM-confirmed edges:
+
+```bash
+# Preview what would be linked (no writes)
+memora-audit-edges --dry-run
+
+# Real run: top similar pairs, LLM decides, writes explicit edges
+memora-audit-edges --limit 40 --min-score 0.80
+
+# Or via uv directly from the repo
+uv run python scripts/audit_edges.py --dry-run
+```
+
+**Why:** similarity hits in `memories_crossrefs` are a rebuildable cache ("looks similar"), while `memory_edges` are durable, typed relationships ("confirmed related") that drive relationship expansion in search. Confirming every pair would need O(n²) LLM calls, so the auditor checks only the strongest candidates each run.
+
+**How it works:** takes crossref pairs with `score >= --min-score` that are not yet in `memory_edges`, asks the LLM whether they are genuinely related (and how: `related_to` / `references` / `extends` / `implements`), and writes edges with `--confidence`-filtered, human-readable reasons via `add_link()`.
+
+**Options:**
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--dry-run` | off | Log only, write nothing |
+| `--min-score` | 0.80 | Crossref similarity threshold |
+| `--limit` | 40 | Max pairs classified per run |
+| `--confidence` | 0.80 | Min LLM confidence to accept a link |
+| `--no-ipv4` | off | Disable IPv4-forced DNS resolution |
+
+**Setup notes:**
+- Standalone tool: no opencode/MCP process required. LLM goes to the OpenAI-compatible endpoint in `OPENAI_BASE_URL` (keyless Zen works: `https://opencode.ai/zen/v1` with empty `OPENAI_API_KEY`).
+- Logs to `<db_dir>/audit_edges.log`; a single-instance lock prevents overlapping runs; `PRAGMA busy_timeout` makes concurrent writes with a running MCP server safe.
+- Optional desktop integration (tray icon + notify-send) requires `pip install memora-mcp[audit]`.
+
+**Suggested weekly systemd user timer** (`~/.config/systemd/user/audit-edges.{service,timer}`):
+
+```ini
+# audit-edges.service
+[Unit]
+Description=Memora edge auditor
+[Service]
+Type=oneshot
+WorkingDirectory=/home/you/memora
+ExecStart=/home/you/.local/bin/uv run python scripts/audit_edges.py --limit 40
+```
+
+```ini
+# audit-edges.timer
+[Unit]
+Description=Run memora edge auditor weekly
+[Timer]
+OnCalendar=Sun 19:00
+Persistent=true
+Unit=audit-edges.service
+[Install]
+WantedBy=timers.target
+```
+
+```bash
+systemctl --user daemon-reload
+systemctl --user enable --now audit-edges.timer
+```
+
+</details>
+
 <details id="document-storage">
 <summary><big><big><strong>Document Storage</strong></big></big></summary>
 

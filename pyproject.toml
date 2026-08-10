@@ -24,6 +24,10 @@ dependencies = [
 local = [
     "sentence-transformers>=2.2.0",
 ]
+audit = [
+    "pystray>=0.19.5",
+    "python-xlib>=0.33",
+]
 dev = [
     "moto[s3]>=5.0.0",
     "pytest>=7.4.0",
@@ -32,6 +36,7 @@ dev = [
 
 [project.scripts]
 memora-server = "memora.server:main"
+memora-audit-edges = "memora.audit:main"
 
 [tool.ruff]
 line-length = 120
